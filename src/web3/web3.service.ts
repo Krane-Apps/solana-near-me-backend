@@ -210,6 +210,14 @@ export class Web3Service implements OnModuleInit {
         .rpc();
 
       console.log("Transaction ID:", tx);
+
+      // Fetch updated accounts to log points and transaction counts
+      const merchantAccount = await this.program.account.merchantAccount.fetch(merchantPDA);
+      const userAccount = await this.program.account.userAccount.fetch(userPDA);
+
+      console.log("Updated Merchant Account - Points:", merchantAccount.points.toNumber(), "TxCount:", merchantAccount.txCount.toNumber());
+      console.log("Updated User Account - Points:", userAccount.points.toNumber(), "TxCount:", userAccount.txCount.toNumber());
+
       return tx;
     } catch (error) {
       console.error("Error incrementing transaction count:", error);
