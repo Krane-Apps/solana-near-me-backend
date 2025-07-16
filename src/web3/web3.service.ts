@@ -1,9 +1,11 @@
 import { Injectable, OnModuleInit, BadRequestException } from '@nestjs/common';
-import { Connection, clusterApiUrl, PublicKey, Keypair } from '@solana/web3.js';
+import { Connection, clusterApiUrl, PublicKey, Keypair, Transaction, SystemProgram } from '@solana/web3.js';
 import { AnchorProvider, Wallet, Program } from '@project-serum/anchor';
+import { TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID, getAssociatedTokenAddress, createTransferInstruction, createAssociatedTokenAccountInstruction, getAccount } from '@solana/spl-token';
 import bs58 from 'bs58';
 import { LatestBlockDto } from './dto/latest-block.dto';
 import { LatestBlockhashDto } from './dto/latest-blockhash.dto';
+import { SupabaseService } from '../supabase/supabase.service';
 
 // Import IDL
 import * as idl from './idl/idl.json';
@@ -14,6 +16,8 @@ export class Web3Service implements OnModuleInit {
   private program: Program;
   private ownerSigner: Keypair;
   private programId: PublicKey;
+
+  constructor(private supabaseService: SupabaseService) {}
 
   async onModuleInit() {
     const devnetRpcUrl = clusterApiUrl('devnet');
@@ -255,7 +259,15 @@ export class Web3Service implements OnModuleInit {
         }
       }
 
-      // Update merchant NFT status
+      // 1. Get NFT address from Supabase
+      const nftAddress = await this.supabaseService.getUnmintedNftDataByType(nftType);
+      console.log("NFT address from Supabase:", nftAddress);
+
+      // 2. Transfer NFT to merchant
+      const transferSignature = await this.transferNftToMerchant(nftAddress, merchantAddress);
+      console.log("NFT transfer completed. Signature:", transferSignature);
+
+      // 3. Update merchant NFT status on-chain
       const verifiedNftMinted = nftType === 'verified' ? true : merchantAccount.verifiedNftMinted;
       const ogNftMinted = nftType === 'og' ? true : merchantAccount.ogNftMinted;
 
@@ -269,10 +281,96 @@ export class Web3Service implements OnModuleInit {
         .signers([this.ownerSigner])
         .rpc();
 
-      console.log("NFT minted successfully. Transaction ID:", tx);
-      return tx;
+      console.log("On-chain update completed. Transaction ID:", tx);
+
+      // 4. Mark NFT as minted in Supabase database (only after successful on-chain update)
+      await this.supabaseService.markNftAsMinted(nftAddress);
+      
+      // Return both signatures as a JSON string for tracking
+      return JSON.stringify({
+        transferSignature,
+        onChainUpdateTx: tx,
+        nftAddress
+      });
     } catch (error) {
       console.error("Error minting NFT:", error);
+      throw error;
+    }
+  }
+
+  /**
+   * Transfer NFT to merchant
+   */
+  async transferNftToMerchant(nftAddress: string, merchantAddress: string): Promise<string> {
+    try {
+      const nftMint = new PublicKey(nftAddress);
+      const merchantWallet = new PublicKey(merchantAddress);
+      
+      // Get associated token addresses
+      const ownerTokenAccount = await getAssociatedTokenAddress(nftMint, this.ownerSigner.publicKey);
+      const merchantTokenAccount = await getAssociatedTokenAddress(nftMint, merchantWallet);
+      
+      console.log("Owner token account:", ownerTokenAccount.toString());
+      console.log("Merchant token account:", merchantTokenAccount.toString());
+      
+      // Check if owner has the NFT
+      try {
+        const ownerAccount = await getAccount(this.connection, ownerTokenAccount);
+        if (ownerAccount.amount < 1n) {
+          throw new BadRequestException('Owner does not have the NFT to transfer');
+        }
+      } catch (error) {
+        throw new BadRequestException('Owner token account does not exist or NFT not found');
+      }
+      
+      // Create transaction
+      const transaction = new Transaction();
+      
+      // Check if merchant token account exists, create if not
+      try {
+        await getAccount(this.connection, merchantTokenAccount);
+        console.log("Merchant token account already exists");
+      } catch (error) {
+        console.log("Creating merchant token account...");
+        const createAccountInstruction = createAssociatedTokenAccountInstruction(
+          this.ownerSigner.publicKey, // payer
+          merchantTokenAccount, // associated token account
+          merchantWallet, // owner
+          nftMint, // mint
+          TOKEN_PROGRAM_ID,
+          ASSOCIATED_TOKEN_PROGRAM_ID
+        );
+        transaction.add(createAccountInstruction);
+      }
+      
+      // Create transfer instruction
+      const transferInstruction = createTransferInstruction(
+        ownerTokenAccount,
+        merchantTokenAccount,
+        this.ownerSigner.publicKey,
+        1, // Transfer 1 NFT
+        [],
+        TOKEN_PROGRAM_ID
+      );
+      
+      transaction.add(transferInstruction);
+      
+      // Get recent blockhash
+      const { blockhash } = await this.connection.getLatestBlockhash();
+      transaction.recentBlockhash = blockhash;
+      transaction.feePayer = this.ownerSigner.publicKey;
+      
+      // Sign and send transaction
+      transaction.sign(this.ownerSigner);
+      const signature = await this.connection.sendRawTransaction(transaction.serialize());
+      
+      // Confirm transaction
+      await this.connection.confirmTransaction(signature, 'confirmed');
+      
+      console.log("NFT transferred successfully. Transaction signature:", signature);
+      return signature;
+    } catch (error) {
+      console.error("Error transferring NFT:", error);
       throw error;
     }
   }
