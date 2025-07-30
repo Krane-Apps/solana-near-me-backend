@@ -190,7 +190,7 @@ export class Web3Service implements OnModuleInit {
     
     try {
       // Validate transaction timestamp
-      await this.validateTransactionTimestamp(transactionId);
+      // await this.validateTransactionTimestamp(transactionId);
       
       // Calculate PDAs
       const { userPDA } = await this.fetchUserPDA(userAddress);
